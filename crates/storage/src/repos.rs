@@ -254,12 +254,127 @@ pub async fn set_last_indexed_block(pool: &PgPool, block_number: i64) -> Result<
 
 // ─── Analytics Queries ──────────────────────────────────────────────────────
 
-/// Total Value Locked — sum of total_supply across all tokens.
-/// Returns a list of (symbol, total_supply) pairs.
-pub async fn get_tvl(pool: &PgPool) -> Result<Vec<(String, String, String)>, sqlx::Error> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT address, symbol, total_supply FROM tokens ORDER BY CAST(total_supply AS NUMERIC) DESC",
+/// Per-token transfer volume — total value transferred per token.
+/// Returns (address, symbol, total_volume, transfer_count).
+pub async fn get_token_volumes(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, String, i64)>, sqlx::Error> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT t.address, t.symbol,
+               COALESCE(SUM(CAST(tr.amount AS NUMERIC)), 0)::TEXT AS total_volume,
+               COUNT(tr.id) AS transfer_count
+        FROM tokens t
+        LEFT JOIN transfers tr ON t.address = tr.token_address
+        GROUP BY t.address, t.symbol
+        ORDER BY COALESCE(SUM(CAST(tr.amount AS NUMERIC)), 0) DESC
+        "#,
     )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Global aggregate stats — total value transferred and total transactions across all tokens.
+/// Returns (total_volume, total_transfers).
+pub async fn get_global_stats(pool: &PgPool) -> Result<(String, i64), sqlx::Error> {
+    let row: (String, i64) = sqlx::query_as(
+        r#"
+        SELECT COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::TEXT,
+               COUNT(*)
+        FROM transfers
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Total unique active addresses (senders + receivers).
+pub async fn get_active_address_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(
+        r#"
+        SELECT COUNT(DISTINCT addr) FROM (
+            SELECT from_address AS addr FROM transfers WHERE from_address != '0x0000000000000000000000000000000000000000'
+            UNION
+            SELECT to_address AS addr FROM transfers WHERE to_address != '0x0000000000000000000000000000000000000000'
+        ) sub
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
+// ─── Time-Series Queries ────────────────────────────────────────────────────
+
+/// Daily transfer volume aggregated across all tokens.
+/// Returns rows of (date, total_volume, transfer_count).
+pub async fn get_daily_volume(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT DATE(created_at)::TEXT AS day,
+               COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::TEXT AS volume,
+               COUNT(*) AS tx_count
+        FROM transfers
+        GROUP BY DATE(created_at)
+        ORDER BY day DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Monthly transfer volume aggregated across all tokens.
+/// Returns rows of (month, total_volume, transfer_count).
+pub async fn get_monthly_volume(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT TO_CHAR(DATE_TRUNC('month', created_at), 'YYYY-MM') AS month,
+               COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::TEXT AS volume,
+               COUNT(*) AS tx_count
+        FROM transfers
+        GROUP BY DATE_TRUNC('month', created_at)
+        ORDER BY month DESC
+        LIMIT $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Daily volume + activity for a specific token.
+/// Returns rows of (date, volume, transfer_count).
+pub async fn get_token_daily_volume(
+    pool: &PgPool,
+    token_address: &str,
+    limit: i64,
+) -> Result<Vec<(String, String, i64)>, sqlx::Error> {
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        r#"
+        SELECT DATE(created_at)::TEXT AS day,
+               COALESCE(SUM(CAST(amount AS NUMERIC)), 0)::TEXT AS volume,
+               COUNT(*) AS tx_count
+        FROM transfers
+        WHERE token_address = $1
+        GROUP BY DATE(created_at)
+        ORDER BY day DESC
+        LIMIT $2
+        "#,
+    )
+    .bind(token_address)
+    .bind(limit)
     .fetch_all(pool)
     .await?;
     Ok(rows)

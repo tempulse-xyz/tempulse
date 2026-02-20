@@ -47,7 +47,14 @@ async fn main() {
             "/api/v1/tokens/:address/transfers",
             get(get_token_transfers),
         )
-        .route("/api/v1/stats/tvl", get(get_tvl))
+        .route("/api/v1/stats/volume", get(get_volume))
+        .route("/api/v1/stats/overview", get(get_overview))
+        .route("/api/v1/stats/daily", get(get_daily_volume))
+        .route("/api/v1/stats/monthly", get(get_monthly_volume))
+        .route(
+            "/api/v1/tokens/:address/volume/daily",
+            get(get_token_daily_volume),
+        )
         .route("/api/v1/activity/recent", get(get_recent_activity))
         .route("/health", get(health))
         .with_state(state);
@@ -75,15 +82,24 @@ struct ApiResponse<T: Serialize> {
 }
 
 #[derive(Serialize)]
-struct TvlEntry {
+struct TokenVolumeEntry {
     token_address: String,
     symbol: String,
-    total_supply: String,
+    total_volume: String,
+    transfer_count: i64,
 }
 
 #[derive(Serialize)]
-struct TvlResponse {
-    tokens: Vec<TvlEntry>,
+struct VolumeResponse {
+    tokens: Vec<TokenVolumeEntry>,
+}
+
+#[derive(Serialize)]
+struct OverviewResponse {
+    total_value_transferred: String,
+    total_transactions: i64,
+    active_addresses: i64,
+    tracked_tokens: i64,
 }
 
 fn json_ok<T: Serialize>(data: T) -> Json<ApiResponse<T>> {
@@ -159,27 +175,49 @@ async fn get_token_transfers(
     Ok(json_ok(transfers))
 }
 
-/// GET /api/v1/stats/tvl — total value locked across all tokens.
-async fn get_tvl(
+/// GET /api/v1/stats/volume — per-token transfer volumes.
+async fn get_volume(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
-    let rows = storage::repos::get_tvl(&state.pool)
+    let rows = storage::repos::get_token_volumes(&state.pool)
         .await
         .map_err(|e| json_err(&e.to_string()).into())?;
 
-    let tokens: Vec<TvlEntry> = rows
+    let tokens: Vec<TokenVolumeEntry> = rows
         .into_iter()
-        .map(|(address, symbol, supply)| TvlEntry {
+        .map(|(address, symbol, volume, count)| TokenVolumeEntry {
             token_address: address,
             symbol,
-            total_supply: supply,
+            total_volume: volume,
+            transfer_count: count,
         })
         .collect();
 
-    Ok(json_ok(TvlResponse { tokens }))
+    Ok(json_ok(VolumeResponse { tokens }))
 }
 
-/// GET /api/v1/activity/recent — latest transfers across all tokens.
+/// GET /api/v1/stats/overview — global payment analytics.
+async fn get_overview(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
+    let (total_volume, total_txs) = storage::repos::get_global_stats(&state.pool)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+    let active_addrs = storage::repos::get_active_address_count(&state.pool)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+    let token_count = storage::repos::get_token_count(&state.pool)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+
+    Ok(json_ok(OverviewResponse {
+        total_value_transferred: total_volume,
+        total_transactions: total_txs,
+        active_addresses: active_addrs,
+        tracked_tokens: token_count,
+    }))
+}
+
 async fn get_recent_activity(
     State(state): State<Arc<AppState>>,
     Query(params): Query<PaginationParams>,
@@ -189,4 +227,77 @@ async fn get_recent_activity(
         .await
         .map_err(|e| json_err(&e.to_string()).into())?;
     Ok(json_ok(transfers))
+}
+
+// ─── Time-Series Handlers ───────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct TimeSeriesEntry {
+    date: String,
+    volume: String,
+    transfer_count: i64,
+}
+
+/// GET /api/v1/stats/daily — daily transfer volume (global).
+async fn get_daily_volume(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PaginationParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
+    let limit = params.limit.unwrap_or(90);
+    let rows = storage::repos::get_daily_volume(&state.pool, limit)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+
+    let entries: Vec<TimeSeriesEntry> = rows
+        .into_iter()
+        .map(|(date, volume, count)| TimeSeriesEntry {
+            date,
+            volume,
+            transfer_count: count,
+        })
+        .collect();
+    Ok(json_ok(entries))
+}
+
+/// GET /api/v1/stats/monthly — monthly transfer volume (global).
+async fn get_monthly_volume(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PaginationParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
+    let limit = params.limit.unwrap_or(24);
+    let rows = storage::repos::get_monthly_volume(&state.pool, limit)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+
+    let entries: Vec<TimeSeriesEntry> = rows
+        .into_iter()
+        .map(|(date, volume, count)| TimeSeriesEntry {
+            date,
+            volume,
+            transfer_count: count,
+        })
+        .collect();
+    Ok(json_ok(entries))
+}
+
+/// GET /api/v1/tokens/:address/volume/daily — daily volume for a specific token.
+async fn get_token_daily_volume(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Query(params): Query<PaginationParams>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ApiResponse<String>>)> {
+    let limit = params.limit.unwrap_or(90);
+    let rows = storage::repos::get_token_daily_volume(&state.pool, &address, limit)
+        .await
+        .map_err(|e| json_err(&e.to_string()).into())?;
+
+    let entries: Vec<TimeSeriesEntry> = rows
+        .into_iter()
+        .map(|(date, volume, count)| TimeSeriesEntry {
+            date,
+            volume,
+            transfer_count: count,
+        })
+        .collect();
+    Ok(json_ok(entries))
 }
